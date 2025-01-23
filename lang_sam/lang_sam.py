@@ -3,19 +3,35 @@ import os
 import groundingdino.datasets.transforms as T
 import numpy as np
 import torch
+from PIL import Image
 from groundingdino.models import build_model
 from groundingdino.util import box_ops
 from groundingdino.util.inference import predict
 from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import clean_state_dict
 from huggingface_hub import hf_hub_download
-from segment_anything import sam_model_registry
-from segment_anything import SamPredictor
+from hydra import compose
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 SAM_MODELS = {
-    "vit_h": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
-    "vit_l": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
-    "vit_b": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+    "sam2.1_hiera_tiny": {
+        "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt",
+        "config": "configs/sam2.1/sam2.1_hiera_t.yaml",
+    },
+    "sam2.1_hiera_small": {
+        "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt",
+        "config": "configs/sam2.1/sam2.1_hiera_s.yaml",
+    },
+    "sam2.1_hiera_base_plus": {
+        "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt",
+        "config": "configs/sam2.1/sam2.1_hiera_b+.yaml",
+    },
+    "sam2.1_hiera_large": {
+        "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
+        "config": "configs/sam2.1/sam2.1_hiera_l.yaml",
+    },
 }
 
 CACHE_PATH = os.environ.get("TORCH_HOME", os.path.expanduser("~/.cache/torch/hub/checkpoints"))
@@ -47,45 +63,46 @@ def transform_image(image) -> torch.Tensor:
     return image_transformed
 
 
-class LangSAM():
+class LangSAM2():
 
-    def __init__(self, sam_type="vit_h", ckpt_path=None):
+    def __init__(self, sam_type="sam2.1_hiera_small", ckpt_path: str | None = None):
         self.sam_type = sam_type
+        self.ckpt_path = ckpt_path
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.build_groundingdino()
-        self.build_sam(ckpt_path)
+        self.build_sam2()
 
-    def build_sam(self, ckpt_path):
-        if self.sam_type is None or ckpt_path is None:
-            if self.sam_type is None:
-                print("No sam type indicated. Using vit_h by default.")
-                self.sam_type = "vit_h"
-            checkpoint_url = SAM_MODELS[self.sam_type]
-            try:
-                sam = sam_model_registry[self.sam_type]()
-                state_dict = torch.hub.load_state_dict_from_url(checkpoint_url)
-                sam.load_state_dict(state_dict, strict=True)
-            except:
-                raise ValueError(f"Problem loading SAM please make sure you have the right model type: {self.sam_type} \
-                    and a working checkpoint: {checkpoint_url}. Recommend deleting the checkpoint and \
-                    re-downloading it.")
-            sam.to(device=self.device)
-            self.sam = SamPredictor(sam)
+
+    def _load_checkpoint(self, model: torch.nn.Module):
+        if self.ckpt_path is None:
+            checkpoint_url = SAM_MODELS[self.sam_type]["url"]
+            state_dict = torch.hub.load_state_dict_from_url(checkpoint_url, map_location="cpu")["model"]
         else:
-            try:
-                sam = sam_model_registry[self.sam_type](ckpt_path)
-            except:
-                raise ValueError(f"Problem loading SAM. Your model type: {self.sam_type} \
-                should match your checkpoint path: {ckpt_path}. Recommend calling LangSAM \
-                using matching model type AND checkpoint path")
-            sam.to(device=self.device)
-            self.sam = SamPredictor(sam)
+            state_dict = torch.load(self.ckpt_path, map_location="cpu", weights_only=True)
+        try:
+            model.load_state_dict(state_dict, strict=True)
+        except Exception as e:
+            raise ValueError(f"Problem loading SAM please make sure you have the right model type: {self.sam_type} \
+                and a working checkpoint: {checkpoint_url}. Recommend deleting the checkpoint and \
+                re-downloading it. Error: {e}")
+    
+
+    def build_sam2(self):
+        cfg = compose(config_name=SAM_MODELS[self.sam_type]["config"], overrides=[])
+        OmegaConf.resolve(cfg)
+        model = instantiate(cfg.model, _recursive_=True)
+        self._load_checkpoint(model)
+        model = model.to(self.device)
+        model.eval()
+        self.sam = SAM2ImagePredictor(model)
+
 
     def build_groundingdino(self):
         ckpt_repo_id = "ShilongLiu/GroundingDINO"
         ckpt_filename = "groundingdino_swinb_cogcoor.pth"
         ckpt_config_filename = "GroundingDINO_SwinB.cfg.py"
         self.groundingdino = load_model_hf(ckpt_repo_id, ckpt_filename, ckpt_config_filename)
+
 
     def predict_dino(self, image_pil, text_prompt, box_threshold, text_threshold):
         image_trans = transform_image(image_pil)
@@ -100,22 +117,19 @@ class LangSAM():
 
         return boxes, logits, phrases
 
-    def predict_sam(self, image_pil, boxes):
+
+    def predict_sam2(self, image_pil, boxes):
         image_array = np.asarray(image_pil)
         self.sam.set_image(image_array)
-        transformed_boxes = self.sam.transform.apply_boxes_torch(boxes, image_array.shape[:2])
-        masks, _, _ = self.sam.predict_torch(
-            point_coords=None,
-            point_labels=None,
-            boxes=transformed_boxes.to(self.sam.device),
-            multimask_output=False,
-        )
-        return masks.cpu()
+        masks, _, _ = self.sam.predict(box=boxes, multimask_output=False)
+        return torch.from_numpy(masks.astype(np.bool))
+    
 
     def predict(self, image_pil, text_prompt, box_threshold=0.3, text_threshold=0.25):
         boxes, logits, phrases = self.predict_dino(image_pil, text_prompt, box_threshold, text_threshold)
         masks = torch.tensor([])
         if len(boxes) > 0:
-            masks = self.predict_sam(image_pil, boxes)
+            masks = self.predict_sam2(image_pil, boxes)
             masks = masks.squeeze(1)
         return masks, boxes, phrases, logits
+        
