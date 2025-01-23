@@ -56,7 +56,7 @@ Use as a library:
 from PIL import Image
 from lang_sam import LangSAM2
 
-model = LangSAM()
+model = LangSAM2()
 image_pil = Image.open("./assets/car.jpeg").convert("RGB")
 text_prompt = "wheel"
 masks, boxes, phrases, logits = model.predict(image_pil, text_prompt)
@@ -68,9 +68,9 @@ First download a model checkpoint.
 
 ```python
 from PIL import Image
-from lang_sam import LangSAM
+from lang_sam import LangSAM2
 
-model = LangSAM("<model_type>", "<path/to/checkpoint>")
+model = LangSAM2("<model_type>", "<path/to/checkpoint>")
 image_pil = Image.open("./assets/car.jpeg").convert("RGB")
 text_prompt = "wheel"
 masks, boxes, phrases, logits = model.predict(image_pil, text_prompt)
